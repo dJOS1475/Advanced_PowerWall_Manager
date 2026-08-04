@@ -24,15 +24,19 @@ This app has been written against, and only tested with, the following stack. Su
 
 | Role | Integration | Where to get it |
 |------|-------------|-----------------|
-| Powerwall | **Tesla Powerwall 2** integration by **DarwinsDen** | GitHub (DarwinsDen) |
+| Powerwall | **Tesla Powerwall 2** integration by DarwinsDen | [`tesla-powerwall-manager.groovy`](tesla-powerwall-manager.groovy) + [`tesla-powerwall.groovy`](tesla-powerwall.groovy) |
+| Solar forecast | **Solcast_dual** by Alan F ([upstream](https://github.com/youzer-name/Solcast_dual)) | [`Solcast_dual.groovy`](Solcast_dual.groovy) |
+| Solar generation | **Fronius Solar Inverter** | [`Fronius_Solar_Inverter.groovy`](Fronius_Solar_Inverter.groovy) |
 | Weather alerts | **OpenWeather Alerts** driver | Hubitat Package Manager |
 | Weather station | **Weather Underground** driver | Hubitat Package Manager |
-| Solar forecast | **Solcast_dual** by Alan F | [github.com/youzer-name/Solcast_dual](https://github.com/youzer-name/Solcast_dual) |
-| Solar generation | **Fronius Inverter** integration | GitHub |
+
+The first three are **included in this repository** — use these copies, since they are the versions the app has been tested against. The two weather drivers come from HPM.
 
 If you are on a **Powerwall 3** or a different Powerwall driver, check the command contract below before assuming it will work.
 
 ### Powerwall — Tesla Powerwall 2 (DarwinsDen)
+
+DarwinsDen's integration is two files, both [included here](tesla-powerwall-manager.groovy): the manager app signs in to your Tesla account and creates the Powerwall device, which runs the driver. Install both.
 
 The app assumes **13.5 kWh usable capacity per unit** and a **99% charge ceiling in Backup-Only mode**, both of which are Powerwall 2 behaviour. The 99% ceiling is why the charge target is capped there — a target of 100% could never be satisfied and would leave the Powerwall charging indefinitely.
 
@@ -50,7 +54,9 @@ Substituting a different driver requires these to be present:
 
 ### Solar forecast — Solcast_dual (optional, recommended)
 
-Requires a [Solcast](https://solcast.com) hobbyist account (free tier) with your rooftop site configured. The `Solcast_dual` driver supports two sites; the app reads the **combined, unsuffixed** attributes rather than the per-site `_a` / `_b` variants:
+Requires a [Solcast](https://solcast.com) hobbyist account (free tier) with your rooftop site configured. Use the [copy in this repository](Solcast_dual.groovy) rather than upstream.
+
+The driver is built for two arrays and requires **both** site resource IDs — if you have a single array, enter the same resource ID for site A and site B. The app reads the **combined, unsuffixed** attributes rather than the per-site `_a` / `_b` variants:
 
 - `24_Hour_Estimate`
 - `24_Hour_Estimate_Low`
@@ -62,9 +68,11 @@ The free API tier is call-limited, which constrains polling. See [Solcast pollin
 
 Without a forecast device the solar surplus model cannot run and the charge target falls back to 0%.
 
-### Solar generation — Fronius Inverter (optional)
+### Solar generation — Fronius Solar Inverter (optional)
 
-Provides the `energy` attribute as **daily cumulative kWh, resetting at midnight**. This is what the solar-noon trend analysis measures.
+The [bundled driver](Fronius_Solar_Inverter.groovy) polls the inverter directly over your local network — no cloud account needed. Configure it with the inverter's IP address, port (default 80) and inverter number (typically 1). It provides the `energy` attribute as **daily cumulative kWh, resetting at midnight**, which is what the solar-noon trend analysis measures.
+
+> **GEN24 inverters:** the driver's *GEN24 Compatibility Mode* disables daily and yearly energy tracking. With it enabled the trend analysis has no daily figure to work from and cannot run. If you are on a GEN24, expect the app to stay on the Mid estimate.
 
 > **Watch out when assigning this device.** Both the Solcast and Fronius devices present `capability.energyMeter`, so both appear in the picker — and `Solcast_dual` also exposes an `energy` attribute. Selecting the forecast device here would silently break the trend analysis. Assign the Fronius inverter as *Solar Generation Device* and Solcast as *Solar Forecast Device*.
 
@@ -298,10 +306,39 @@ The main page shows live present/missing status for both.
 
 ## Installation
 
-1. In Hubitat, go to **Apps Code → + New App** and paste in `AdvancedPowerwallManager.groovy`.
+### 1. Drivers and integrations
+
+Install these first — the app cannot be configured until the devices exist.
+
+| Step | Where | What |
+|------|-------|------|
+| Powerwall driver | **Drivers Code → + New Driver** | [`tesla-powerwall.groovy`](tesla-powerwall.groovy) |
+| Powerwall manager app | **Apps Code → + New App** | [`tesla-powerwall-manager.groovy`](tesla-powerwall-manager.groovy) — add it as a user app and sign in; it creates the Powerwall device |
+| Solcast driver | **Drivers Code → + New Driver** | [`Solcast_dual.groovy`](Solcast_dual.groovy), then create a **Virtual Device** using it and enter your API key plus **both** site resource IDs |
+| Fronius driver | **Drivers Code → + New Driver** | [`Fronius_Solar_Inverter.groovy`](Fronius_Solar_Inverter.groovy), then create a **Virtual Device** using it and enter the inverter's IP address |
+| Weather drivers | **Hubitat Package Manager** | OpenWeather Alerts and Weather Underground |
+| Grid presence | **Devices → Add Virtual Device** | Virtual Presence — see [Grid presence sensor](#grid-presence-sensor) |
+
+### 2. The app
+
+1. Go to **Apps Code → + New App** and paste in [`AdvancedPowerwallManager.groovy`](AdvancedPowerwallManager.groovy).
 2. Go to **Apps → + Add User App** and select **Advanced Powerwall Manager**.
-3. Assign devices, choose a charging mode, and work through the configuration pages.
+3. Assign the six devices, choose a charging mode, and work through the configuration pages.
 4. Press **Done**. The hub variables are created on save.
+5. Set the Solcast device's polling schedule — see below.
+
+### 3. Verify
+
+Open the app and check the **Status Panel**. Early signs something is misconfigured:
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Solar forecast rows show *stale* | Solcast has not polled yet today, or the API key is wrong |
+| Trend Analysis shows *Not configured* | Solar Generation Device not assigned |
+| Trend Analysis stuck on Mid all day | Fronius GEN24 Compatibility Mode is on, disabling daily energy |
+| Trend Analysis shows *Awaiting sunrise/sunset data* | Hub location not set |
+| Charge Target stuck at 0% | Annual average consumption not set, or no forecast device |
+| Hub variables show ✗ missing | Creation failed — check logs and create them manually |
 
 ### Solcast polling schedule
 
