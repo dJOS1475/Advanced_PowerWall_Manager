@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target based on the day's solar forecast, measured generation, and seasonal household consumption.
 
-**Current version: 3.9.0**
+**Current version: 3.9.0** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
 
 ---
 
@@ -18,9 +18,25 @@ A **time-of-use electricity tariff**. The entire premise of the app is that elec
 
 For **Free Off-peak Charging** you additionally need a plan with a zero-cost midday window — Victoria's "midday saver" or an equivalent scheme.
 
-### Powerwall driver contract
+### Tested configuration
 
-A Tesla Powerwall with a Hubitat driver exposing the following. Any driver works provided it presents these:
+This app has been written against, and only tested with, the following stack. Substitutions are possible — the app depends on attribute and command names, not on specific drivers — but nothing else has been verified.
+
+| Role | Integration | Where to get it |
+|------|-------------|-----------------|
+| Powerwall | **Tesla Powerwall 2** integration by **DarwinsDen** | GitHub (DarwinsDen) |
+| Weather alerts | **OpenWeather Alerts** driver | Hubitat Package Manager |
+| Weather station | **Weather Underground** driver | Hubitat Package Manager |
+| Solar forecast | **Solcast_dual** by Alan F | [github.com/youzer-name/Solcast_dual](https://github.com/youzer-name/Solcast_dual) |
+| Solar generation | **Fronius Inverter** integration | GitHub |
+
+If you are on a **Powerwall 3** or a different Powerwall driver, check the command contract below before assuming it will work.
+
+### Powerwall — Tesla Powerwall 2 (DarwinsDen)
+
+The app assumes **13.5 kWh usable capacity per unit** and a **99% charge ceiling in Backup-Only mode**, both of which are Powerwall 2 behaviour. The 99% ceiling is why the charge target is capped there — a target of 100% could never be satisfied and would leave the Powerwall charging indefinitely.
+
+Substituting a different driver requires these to be present:
 
 | Type | Name | Used for |
 |------|------|----------|
@@ -32,38 +48,42 @@ A Tesla Powerwall with a Hubitat driver exposing the following. Any driver works
 
 > **Grid charging must be permitted on your Powerwall.** The app charges by placing the Powerwall in Backup-Only, which draws from the grid to hold its backup reserve. If grid charging is disabled in your Tesla app or by your installer, the app will set modes correctly but nothing will actually charge.
 
-### Solar forecast — optional, recommended
+### Solar forecast — Solcast_dual (optional, recommended)
 
-A [Solcast](https://solcast.com) hobbyist account (free tier) with your rooftop site configured, plus a Hubitat driver exposing:
+Requires a [Solcast](https://solcast.com) hobbyist account (free tier) with your rooftop site configured. The `Solcast_dual` driver supports two sites; the app reads the **combined, unsuffixed** attributes rather than the per-site `_a` / `_b` variants:
 
 - `24_Hour_Estimate`
 - `24_Hour_Estimate_Low`
 - `24_Hour_Estimate_High`
 
-> **These must be full calendar-day totals in kWh, not rest-of-day figures.** The trend analysis compares generation-so-far against the day's total; if the driver returns only remaining generation the comparison is meaningless. Verify by noting the value at two different times on a normal day — roughly flat means full-day, a large drop means rest-of-day.
+> **These must be full calendar-day totals in kWh, not rest-of-day figures.** The trend analysis compares generation-so-far against the day's total; if a substituted driver returns only remaining generation the comparison is meaningless. Verify by noting the value at two different times on a normal day — roughly flat means full-day, a large drop means rest-of-day.
 
-The free API tier is call-limited, which constrains polling. See [Solcast polling schedule](#solcast-polling-schedule) for placement that matters more than frequency.
+The free API tier is call-limited, which constrains polling. See [Solcast polling schedule](#solcast-polling-schedule) for placement, which matters more than frequency.
 
 Without a forecast device the solar surplus model cannot run and the charge target falls back to 0%.
 
-### Solar generation meter — optional
+### Solar generation — Fronius Inverter (optional)
 
-Any device exposing an `energy` attribute as **daily cumulative kWh that resets at midnight**. This is what the solar-noon trend analysis measures.
+Provides the `energy` attribute as **daily cumulative kWh, resetting at midnight**. This is what the solar-noon trend analysis measures.
 
-If your meter is a lifetime counter instead, the app detects the implausible projection, logs a warning and falls back to the Mid estimate rather than acting on bad data — so a wrong assumption here degrades gracefully.
+> **Watch out when assigning this device.** Both the Solcast and Fronius devices present `capability.energyMeter`, so both appear in the picker — and `Solcast_dual` also exposes an `energy` attribute. Selecting the forecast device here would silently break the trend analysis. Assign the Fronius inverter as *Solar Generation Device* and Solcast as *Solar Forecast Device*.
+
+If a substituted meter turns out to be a lifetime counter rather than a daily one, the app detects the implausible projection, logs a warning and falls back to the Mid estimate rather than acting on bad data.
 
 Without this device the trend analysis cannot run and the Mid estimate is always used.
 
-### Weather devices
+### Weather — OpenWeather Alerts and Weather Underground
 
-- An **OpenWeather-type driver** exposing `alertDescrFull` (alert text) and `forecastHigh` (today's forecast maximum). Required.
-- A **weather station** exposing `temperature`. Optional — used for daily maximum tracking, which feeds the extreme-heat fallback.
+Both are installable through **Hubitat Package Manager**.
+
+- **OpenWeather Alerts** — required. Supplies `alertDescrFull` (full alert text, matched against your region and keywords) and `forecastHigh` (today's forecast maximum, used by the hot-day and extreme-weather checks).
+- **Weather Underground** — optional. Supplies `temperature` for daily maximum tracking, which feeds the extreme-heat fallback. Without it the app falls back to OpenWeather's `temperatureMaximum`.
 
 ### Grid presence sensor
 
 A **virtual presence sensor** reflecting mains grid state: `present` when the grid is up, `not present` during an outage. Create one under **Devices → Add Virtual Device → Virtual Presence**.
 
-The app only *reads* this sensor — something else has to drive it. Typically that is a Rule Machine rule watching a grid-status attribute on your Powerwall driver, or a network ping sensor targeting something outside your house. Without a working source the outage response will never fire, though nothing else is affected.
+The app only *reads* this sensor — something else has to drive it. Typically that is a Rule Machine rule watching the grid status reported by the Powerwall integration, or a network ping sensor targeting something outside your house. Without a working source the outage response will never fire, though nothing else is affected.
 
 ---
 
@@ -252,14 +272,16 @@ Two paths bypass the cooldown deliberately, both because they represent hard dea
 
 Quick reference for the device picker on the main page. Driver requirements and setup notes are in [Prerequisites](#prerequisites).
 
-| Device | Capability | Required | Degrades to if absent |
-|--------|-----------|----------|-----------------------|
-| Tesla Powerwall | `battery` | Yes | — |
-| OpenWeather Alerts | `sensor` | Yes | — |
-| Power Grid Presence Sensor | `presenceSensor` | Yes | — |
-| Weather Station | `temperatureMeasurement` | No | No daily max tracking; extreme-heat fallback uses OpenWeather instead |
-| Solcast Solar Forecast | `energyMeter` | No | Solar surplus model cannot run; charge target falls back to 0% |
-| Solar Generation Meter | `energyMeter` | No | Trend analysis cannot run; Mid estimate always used |
+| App setting | Assign | Capability | Required | Degrades to if absent |
+|-------------|--------|-----------|----------|-----------------------|
+| Powerwall Device | Tesla Powerwall 2 | `battery` | Yes | — |
+| OpenWeather Alerts Device | OpenWeather Alerts | `sensor` | Yes | — |
+| Power Grid Virtual Presence Sensor | Virtual presence device | `presenceSensor` | Yes | — |
+| Weather Station | Weather Underground | `temperatureMeasurement` | No | No daily max tracking; extreme-heat fallback uses OpenWeather instead |
+| Solar Forecast Device | Solcast_dual | `energyMeter` | No | Solar surplus model cannot run; charge target falls back to 0% |
+| Solar Generation Device | Fronius inverter | `energyMeter` | No | Trend analysis cannot run; Mid estimate always used |
+
+> Both Solcast and Fronius present `capability.energyMeter` and both expose an `energy` attribute, so take care not to transpose the last two.
 
 ### Hub Variables
 
