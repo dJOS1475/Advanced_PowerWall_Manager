@@ -6,6 +6,67 @@ A Hubitat Elevation app that consolidates Tesla Powerwall management into a sing
 
 ---
 
+## Prerequisites
+
+### Hub
+
+Hubitat Elevation on firmware that supports `createGlobalVar()` (2.3.x or later). On older firmware the app still works, but you will need to create the two hub variables manually — see [Hub Variables](#hub-variables).
+
+### Tariff
+
+A **time-of-use electricity tariff**. The entire premise of the app is that electricity costs different amounts at different times of day; on a flat-rate tariff there is nothing for it to optimise.
+
+For **Free Off-peak Charging** you additionally need a plan with a zero-cost midday window — Victoria's "midday saver" or an equivalent scheme.
+
+### Powerwall driver contract
+
+A Tesla Powerwall with a Hubitat driver exposing the following. Any driver works provided it presents these:
+
+| Type | Name | Used for |
+|------|------|----------|
+| Attribute | `currentOpState` | Reading the current mode (`Self-Powered` / `Backup-Only`) |
+| Attribute | `battery` | State of charge % |
+| Attribute | `power` | Live charge rate, for remaining-time estimates |
+| Command | `setSelfPoweredMode()` | Returning to normal operation |
+| Command | `setBackupOnlyMode()` | Charging from grid / holding charge |
+
+> **Grid charging must be permitted on your Powerwall.** The app charges by placing the Powerwall in Backup-Only, which draws from the grid to hold its backup reserve. If grid charging is disabled in your Tesla app or by your installer, the app will set modes correctly but nothing will actually charge.
+
+### Solar forecast — optional, recommended
+
+A [Solcast](https://solcast.com) hobbyist account (free tier) with your rooftop site configured, plus a Hubitat driver exposing:
+
+- `24_Hour_Estimate`
+- `24_Hour_Estimate_Low`
+- `24_Hour_Estimate_High`
+
+> **These must be full calendar-day totals in kWh, not rest-of-day figures.** The trend analysis compares generation-so-far against the day's total; if the driver returns only remaining generation the comparison is meaningless. Verify by noting the value at two different times on a normal day — roughly flat means full-day, a large drop means rest-of-day.
+
+The free API tier is call-limited, which constrains polling. See [Solcast polling schedule](#solcast-polling-schedule) for placement that matters more than frequency.
+
+Without a forecast device the solar surplus model cannot run and the charge target falls back to 0%.
+
+### Solar generation meter — optional
+
+Any device exposing an `energy` attribute as **daily cumulative kWh that resets at midnight**. This is what the solar-noon trend analysis measures.
+
+If your meter is a lifetime counter instead, the app detects the implausible projection, logs a warning and falls back to the Mid estimate rather than acting on bad data — so a wrong assumption here degrades gracefully.
+
+Without this device the trend analysis cannot run and the Mid estimate is always used.
+
+### Weather devices
+
+- An **OpenWeather-type driver** exposing `alertDescrFull` (alert text) and `forecastHigh` (today's forecast maximum). Required.
+- A **weather station** exposing `temperature`. Optional — used for daily maximum tracking, which feeds the extreme-heat fallback.
+
+### Grid presence sensor
+
+A **virtual presence sensor** reflecting mains grid state: `present` when the grid is up, `not present` during an outage. Create one under **Devices → Add Virtual Device → Virtual Presence**.
+
+The app only *reads* this sensor — something else has to drive it. Typically that is a Rule Machine rule watching a grid-status attribute on your Powerwall driver, or a network ping sensor targeting something outside your house. Without a working source the outage response will never fire, though nothing else is affected.
+
+---
+
 ## Charging Modes
 
 The app runs in one of three modes, selected from a dropdown on the main page. Only one is ever active, and each keeps its own independent settings so switching between them is a single dropdown change with no reconfiguration.
@@ -189,16 +250,16 @@ Two paths bypass the cooldown deliberately, both because they represent hard dea
 
 ### Devices
 
-| Device | Capability | Required | Purpose |
-|--------|-----------|----------|---------|
-| Tesla Powerwall | `battery` | Yes | Mode control and battery level |
-| OpenWeather Alerts | `sensor` | Yes | Weather alerts and forecast high |
-| Power Grid Presence Sensor | `presenceSensor` | Yes | Grid outage detection (virtual sensor) |
-| Weather Station | `temperatureMeasurement` | No | Daily max temperature tracking |
-| Solcast Solar Forecast | `energyMeter` | No | 24-hour forecast — uses `24_Hour_Estimate`, `_Low` and `_High` |
-| Solar Generation Meter | `energyMeter` | No | Actual daily generation (`energy`, kWh) — required for trend analysis |
+Quick reference for the device picker on the main page. Driver requirements and setup notes are in [Prerequisites](#prerequisites).
 
-Without the Solar Generation Meter the trend analysis cannot run and the Mid estimate is always used.
+| Device | Capability | Required | Degrades to if absent |
+|--------|-----------|----------|-----------------------|
+| Tesla Powerwall | `battery` | Yes | — |
+| OpenWeather Alerts | `sensor` | Yes | — |
+| Power Grid Presence Sensor | `presenceSensor` | Yes | — |
+| Weather Station | `temperatureMeasurement` | No | No daily max tracking; extreme-heat fallback uses OpenWeather instead |
+| Solcast Solar Forecast | `energyMeter` | No | Solar surplus model cannot run; charge target falls back to 0% |
+| Solar Generation Meter | `energyMeter` | No | Trend analysis cannot run; Mid estimate always used |
 
 ### Hub Variables
 
