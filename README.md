@@ -1,8 +1,8 @@
 # Advanced Powerwall Manager
 
-A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target based on the day's solar forecast, measured generation, and seasonal household consumption.
+A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target continuously from your tariff periods, the solar still to come, and measured house load.
 
-**Current version: 3.9.0** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
+**Current version: 4.4.1** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
 
 ---
 
@@ -16,7 +16,7 @@ Hubitat Elevation on firmware that supports `createGlobalVar()` (2.3.x or later)
 
 A **time-of-use electricity tariff**. The entire premise of the app is that electricity costs different amounts at different times of day; on a flat-rate tariff there is nothing for it to optimise.
 
-For **Free Off-peak Charging** you additionally need a plan with a zero-cost midday window — Victoria's "midday saver" or an equivalent scheme.
+You describe the plan as tariff periods — see [Tariff Periods](#tariff-periods). A plan with a zero-cost window (Victoria's "midday saver" and equivalents) is supported as a period with a rate of 0.
 
 ### Tested configuration
 
@@ -46,7 +46,7 @@ Substituting a different driver requires these to be present:
 |------|------|----------|
 | Attribute | `currentOpState` | Reading the current mode (`Self-Powered` / `Backup-Only`) |
 | Attribute | `battery` | State of charge % |
-| Attribute | `power` | Live charge rate, for remaining-time estimates |
+| Attribute | `loadPower` | House consumption in watts — the measured load term in the target |
 | Command | `setSelfPoweredMode()` | Returning to normal operation |
 | Command | `setBackupOnlyMode()` | Charging from grid / holding charge |
 
@@ -62,15 +62,15 @@ The driver is built for two arrays and requires **both** site resource IDs — i
 - `24_Hour_Estimate_Low`
 - `24_Hour_Estimate_High`
 
-> **These must be full calendar-day totals in kWh, not rest-of-day figures.** The trend analysis compares generation-so-far against the day's total; if a substituted driver returns only remaining generation the comparison is meaningless. Verify by noting the value at two different times on a normal day — roughly flat means full-day, a large drop means rest-of-day.
+These are **whole-of-day totals for the current day**, used exactly as published — no reconstruction, no adding back generation already banked. Tomorrow is a separate question, answered by the `48_Hour_Estimate` family, which this app does not read.
 
-The free API tier is call-limited, which constrains polling. See [Solcast polling schedule](#solcast-polling-schedule) for placement, which matters more than frequency.
+Each poll is a fresh prediction for the same day, not a live measurement. Solcast ingests satellite imagery, so an early-afternoon prediction of the afternoon is better informed than a breakfast-time one. The app stores **two** copies per day and uses them for different things — see [Two forecasts a day](#two-forecasts-a-day).
 
-Without a forecast device the solar surplus model cannot run and the charge target falls back to 0%.
+Without a forecast device the target cannot be computed and falls back to 99% — safe, but it will charge more than necessary.
 
 ### Solar generation — Fronius Solar Inverter (optional)
 
-The [bundled driver](Fronius_Solar_Inverter.groovy) polls the inverter directly over your local network — no cloud account needed. Configure it with the inverter's IP address, port (default 80) and inverter number (typically 1). It provides the `energy` attribute as **daily cumulative kWh, resetting at midnight**, which is what the solar-noon trend analysis measures.
+The [bundled driver](Fronius_Solar_Inverter.groovy) polls the inverter directly over your local network — no cloud account needed. Configure it with the inverter's IP address, port (default 80) and inverter number (typically 1). It provides two attributes the app uses: `energy` as **daily cumulative kWh, resetting at midnight** (the trend analysis), and `power` in watts (the live correction to remaining solar).
 
 > **GEN24 inverters:** the driver's *GEN24 Compatibility Mode* disables daily and yearly energy tracking. With it enabled the trend analysis has no daily figure to work from and cannot run. If you are on a GEN24, expect the app to stay on the Mid estimate.
 
@@ -95,144 +95,193 @@ The app only *reads* this sensor — something else has to drive it. Typically t
 
 ---
 
-## Charging Modes
+## Tariff Periods
 
-The app runs in one of three modes, selected from a dropdown on the main page. Only one is ever active, and each keeps its own independent settings so switching between them is a single dropdown change with no reconfiguration.
+You describe your electricity plan as it appears on your bill, and the app derives everything else from it. Between 1 and 8 periods, each with:
 
-| Mode | Use when | Behaviour |
-|------|----------|-----------|
-| **Off-peak Charging** | Traditional time-of-use tariff | Smart, cost-optimised. Solar forecasting, trend analysis, late-start timing. |
-| **Free Off-peak Charging** | Tariff with a zero-cost midday window (Victoria's "midday saver" and equivalents) | Fill the battery during the free window, top up during solar soak. |
-| **None** | Temporarily pausing charging | No charging. Severe weather, extreme weather and grid outage handling stay active. |
+| Field | Meaning |
+|-------|---------|
+| **Type** | Super Off-Peak / Off-Peak / Shoulder / **Peak** |
+| **Start / End** | May wrap midnight — 9pm–11am is an ordinary Australian band |
+| **Days** | Blank for every day, or specific weekdays for a weekend rate |
+| **Rate** | ¢/kWh. Enter **0** for a genuinely free period |
+| **Charge here** | Whether to buy grid energy during this period |
 
-Pages belonging to the inactive mode are tagged `(inactive)` rather than hidden, so you can configure a mode before switching to it.
+**Peak periods are the deadline.** The battery must be full and the Powerwall back in Self-Powered before one begins. Charging never runs during Peak — except under a weather override.
 
----
+There is no separate "charging mode". A free tariff is a period with rate 0; disabling charging entirely is every checkbox unticked.
 
-## How It Works — Off-peak Charging
+### The rate is not just decoration
 
-### Charge Target Calculation
+It does two real jobs beyond display:
 
-A solar-aware charge target runs every 15 minutes within a configurable daily window. The target is written to the `PW_Charge_Target` hub variable and used by the off-peak charging window.
+- **Fill vs Smart.** A period at `0¢` is held in Backup-Only for its whole length, so the house runs on free grid while the battery fills and never discharges. A period above `0¢` charges only while below target, then hands back to Self-Powered.
+- **Vacation Mode** suppresses charging where the rate is above zero, but still permits it at zero — free energy is worth taking whether or not anyone is home.
 
-**The goal:** have the battery as full as possible at the start of peak tariff, so the peak period is covered by stored energy rather than grid imports.
+### Worked example
 
-```
-effective consumption  = annual average × seasonal factor
-solar before peak      = selected Solcast forecast × 90%
-daytime house load     = effective consumption × (8 hrs ÷ 24)
-solar surplus          = max(0,  solar before peak  −  daytime load)
-solar → battery        = min(surplus,  total capacity)
-pre-charge target kWh  = total capacity  −  solar → battery
-charge target %        = pre-charge target ÷ total capacity × 100
-```
+A Victorian midday-saver plan:
 
-- **Poor solar day** (e.g. 10 kWh forecast): house uses all the generation, surplus = 0, battery gets nothing from solar → **maximum pre-charge** from cheap off-peak electricity.
-- **Good solar day** (e.g. 25+ kWh forecast): surplus fills the battery → **low or zero pre-charge** needed.
-- **Seasonal variation** is applied automatically using a sinusoidal Southern Hemisphere curve (±25%, peak in January, trough in July). You enter one annual average figure and the app adjusts it monthly.
+| # | Type | Window | Rate | Charge? |
+|---|------|--------|------|---------|
+| 1 | Super Off-Peak | 11:00–16:00 | 9.90¢ | ☑ |
+| 2 | Off-Peak | 21:00–11:00 | 18.70¢ | ☐ |
+| 3 | Peak | 16:00–21:00 | 46.75¢ | — |
 
-**The target is capped at 99%.** In Backup-Only mode a Powerwall will not charge beyond 99%, so a target of 100% could never be satisfied and would leave the Powerwall charging indefinitely. The cap is applied before the value is written to the hub variable, so every downstream reference sees 99%.
+Charging overnight at 18.7¢ is pointless when 9.9¢ arrives later and still before peak, so only period 1 is ticked. Storing at 9.9¢ to displace a 46.75¢ import saves **36.85¢/kWh**.
 
-### Priority ladder
+### Coverage check
 
-Evaluated in order; the first match wins.
-
-| Priority | Condition | Result |
-|----------|-----------|--------|
-| — | Charging mode is **Free** | 99% — unconditional, ladder skipped entirely |
-| — | Charging mode is **None** | 0% |
-| 1 | Hub mode is `Vacation` | 0% |
-| 2 | Severe weather warning active | Configurable % (default 100 → capped 99) |
-| 3 | Vacation Mode override toggle | 0% |
-| 4 | Hot day forecast during hot-day window | 100% → capped 99 |
-| 5 | Normal | Solar surplus model above |
+The page validates per weekday and reports gaps, overlapping periods, a missing Peak period, and charging enabled on a Peak period. Day restrictions make coverage day-dependent, so each weekday is walked separately.
 
 ---
 
-### Forecast Selection — Solar-Noon Trend Analysis
+## The Charge Target
 
-Solcast publishes three estimates for the day: Low, Mid (P50) and High. Rather than always using the middle one, the app measures how the day is actually tracking and picks accordingly.
+This is where all the intelligence lives. Everything else is a simple comparison against it.
 
-Each day starts on the **Mid** estimate. At **solar noon** — computed daily from sunrise and sunset, roughly 12:25 midwinter to 13:25 midsummer in Melbourne — the app projects actual generation so far to a full-day total and compares it against the morning's forecast band.
+The target is a **level the battery should be at right now**, not a fixed morning figure:
+
+```
+solar to battery = solar still expected before peak − house load until then
+target kWh       = capacity − solar to battery
+target %         = target kWh ÷ capacity, capped at 99
+```
+
+Early in the day plenty of solar is still coming, so the target sits low and grid charging stays out of the way. As the afternoon wears on the remaining solar shrinks and the target climbs, **reaching 99% by the time peak begins**.
+
+That convergence is what guarantees a full battery at peak. It also avoids charging to full early, which on a low feed-in tariff would push the day's remaining solar out to export for almost nothing.
+
+> **Why the previous model couldn't do this.** It credited the *whole day's* solar regardless of how much had already been spent, producing a single morning pre-charge figure. Once the battery passed that figure, charging stopped — so an underdelivering afternoon left you short at peak with no mechanism to notice.
+
+### Both inputs are measured
+
+**Solar remaining** starts from the most recent Solcast forecast, shaped by the real sunrise/sunset curve between now and the deadline, then corrected by live inverter output.
+
+**House load** comes from the Powerwall's own `loadPower` meter — house consumption only, excluding the battery charge draw — accumulated into **per-hour averages for today**, and the prediction uses the mean across today's daylight hours so far.
+
+A single rolling average cannot represent a load that swings between roughly 0.8 kW and 4.3 kW as a heat pump cycles: a fast average chases each compressor start, a slow one lags an hour behind reality. An hourly bucket is a genuine time-weighted mean including both the on and off portions of the duty cycle, and averaging several of them is stable without being stale.
+
+The hours are combined with a **median, not a mean**, and this matters more than it sounds. Pooling every sample makes the result sample-weighted, so a busy hour dominates: one morning heat-pump run left hour 9 averaging 3.94 kW against 1.08–2.15 kW for every other daylight hour, dragging the figure to 2.21 kW — and because it is projected flat across every remaining hour, that predicted 17.3 kWh of load against 10.5 kWh actual. The median of the hourly means gave 1.70 kW. Below three hours of data it falls back to the pooled mean.
+
+Today's own hours are used rather than a profile learned across days, because consumption tracks weather and occupancy rather than a repeating weekly shape. The buckets reset at midnight, so a misleading value cannot outlive the day that produced it. Overnight hours are excluded — they are not representative of the afternoon being extrapolated into. Until about half an hour of daylight samples exist it falls back to the seasonal model, and a wide gross-error guard catches a unit mix-up or a stuck meter.
+
+Neither the old hardcoded `0.90` "solar before peak" factor nor the assumed 8-hour solar day survives — the curve supplies real figures for whatever deadline you configure.
+
+---
+
+## Solar Forecasting
+
+### Two forecasts a day
+
+Solcast is polled several times through the day and revises its view of the same day each time. The app keeps two copies of the Low/Mid/High band, because they answer different questions:
+
+| | Captured | Used by |
+|---|---|---|
+| **Opening** | The first poll of the day, then frozen | The solar-noon trend check |
+| **Latest** | Overwritten by every poll | The charge target, remaining solar, the performance ratio |
+
+The opening band is frozen deliberately. The trend check asks *"is the array delivering what was predicted this morning?"*, and that comparison must use a prediction made **before** the morning it is judging. Solcast reads satellite cloud imagery, so a midday forecast already knows how the morning went — comparing against it would be circular and would report "tracking Mid" almost every day.
+
+The latest band is what everything forward-looking projects from. The charge target only cares about solar still to come between now and peak, and a 13:58 prediction of that afternoon is better informed than an 08:58 one.
+
+The difference between them is itself useful: **latest minus opening** says whether today is now expected to do better or worse than it looked at breakfast. It appears in the status panel next to each estimate, coloured by direction, in a throttled log line as each revision lands, and in the day summary as a total.
+
+Before the day's first poll, the app refuses to fall back on the device attribute — it still holds yesterday's numbers — and the charge target holds its safe default instead.
+
+### Which Solcast estimate — solar-noon trend analysis
+
+Solcast publishes Low, Mid and High estimates. Each day starts on **Mid**. At **solar noon** — computed daily from sunrise and sunset, roughly 12:25 midwinter to 13:25 midsummer in Melbourne — the app projects actual generation to a full-day total and compares it against the morning's band.
 
 ```
 projected day total = generation so far ÷ fraction of solar day elapsed
+f(t) = (1 − cos(π × elapsed)) / 2
 ```
 
-The fraction comes from the normalised integral of a half-sine between sunrise and sunset:
+The fraction is exactly **0.50 at solar noon**, so the projection is simply generation × 2.
+
+This comparison uses the **opening** band, for the reason given above.
+
+What this actually detects is your array's performance against modelled irradiance. Solcast predicts the sun better than any local heuristic, but it cannot see panel soiling, new shading, inverter derating or a dropped string. A projection persistently below the opening band on clear days is a maintenance signal, not a weather one.
+
+Selection is biased toward the conservative choice — under-charging costs a peak-rate import, over-charging only costs the feed-in spread — so the projection must travel `forecastUpgradeBias`% of the way toward a higher estimate before it is selected (default 60%).
+
+### The solar day is computed, not assumed
+
+Nearly everything here depends on knowing **what fraction of the day's generation has already happened**. Remaining solar reduces to `actual × Δf ÷ f_now`, so that fraction is doing all the work — and an idealised curve gets it badly wrong.
+
+The obvious model is a half-sine between sunrise and sunset, symmetric about solar noon. Measured against a cloudless day at the reference site — **1.5 kW facing NE and 3.9 kW facing NW**, southern hemisphere, so nearly three quarters of the capacity is on the afternoon sun:
+
+| Time | Half-sine says | Geometry says | Actually |
+|---|---|---|---|
+| 09:01 | 11.6% | 8.3% | **5.0%** |
+| 10:04 | 22.0% | 17.7% | 14.6% |
+| 11:06 | 34.5% | 29.9% | 28.4% |
+| 12:09 | 48.3% | 44.3% | 44.3% |
+| 13:43 | 68.9% | 66.4% | 68.6% |
+| 15:16 | 86.0% | 85.3% | 87.1% |
+| **Mean error** | **0.038** | **0.020** | — |
+| **At solar noon** | 0.500 | **0.461** | 0.464 |
+
+An overstated `f_now` **halves** the projected remaining solar, which is how a 25 kWh day gets grid-charged as though it will produce 14.
+
+So the curve is answered in three layers, each falling back to the one below.
+
+**1 · Geometry.** Configure your arrays under *Charge Level → Panel Array Geometry* — kW, compass azimuth and tilt per roof face — and the app computes when your generation arrives. Declination from the date, hour angle from solar noon taken as the midpoint of the hub's own sunrise and sunset (which absorbs the equation of time and longitude for free), clear-sky beam irradiance plus an isotropic diffuse term, integrated across the day.
+
+Only the *shape* comes from this; magnitude still comes from Solcast. That makes the crude irradiance model cheap and the result barely sensitive to tilt — 15°, 22.5° and 30° all land within 0.003, so an approximate roof pitch is fine. It is correct on day one, immune to weather, and exact through the seasons because declination is a function of the date.
+
+The settings page previews the curve as you enter it, so a mistyped azimuth shows up immediately instead of quietly biasing the target for weeks.
+
+**2 · Idealised.** The half-sine, used only when no arrays are configured.
+
+**3 · Measured correction.** What geometry cannot see: terrain shading, soiling, a dropped string. Each day is banked as the **difference** between what it actually did and what the computed curve predicted — a small signed number centred near zero, so day-to-day weather largely cancels in the median rather than being mistaken for the site's shape. That is the answer to the obvious objection that twenty days of history is twenty days of weather.
+
+On the day above the correction runs about −0.03 through the morning and +0.02 in the afternoon: the ranges to the east, and nothing else. It needs five banked days before it applies, and days producing under 3 kWh are discarded.
+
+The profile is indexed by **slice of the solar day, not clock hour** — hour-indexing would bake today's daylight length into the curve, and near an equinox that moves about two minutes a day.
+
+> This also fixes the solar-noon trend check, which divides by that same fraction. A symmetric curve assumes exactly 0.50 at solar noon; this site's true figure is 0.46, and every projection was understated by the difference.
+
+### Live correction from inverter output
+
+The cumulative curve's derivative gives expected generation right now:
 
 ```
-f(t) = (1 − cos(π × elapsed)) / 2        elapsed = (t − sunrise) / (sunset − sunrise)
+f'(e) = (π/2) · sin(πe)
+expectedKw = fullDayKwh × (π/2) × sin(π·e) ÷ dayLengthHours
 ```
 
-This yields 0.0 at sunrise, exactly **0.50 at solar noon**, and 1.0 at sunset — so at the decision point the projection is simply **generation × 2**. Because it is anchored to real sun times it self-adjusts for season and daylight saving.
+It integrates to exactly 1.0 across the day, so it is consistent with the forecast by construction. Measured output divided by this gives a performance ratio that scales the remaining-solar estimate in real time — catching a cloud bank that cumulative energy would take hours to reveal.
 
-**Why the baseline must predate the morning.** The band it compares against is snapshotted from the *first* forecast poll of the day (~08:58), not the current one. Solcast ingests satellite cloud imagery, so a midday forecast already reflects the morning's actual weather — comparing generation-so-far against it would be circular and would conclude "tracking Mid" almost every day.
+The ratio is **clamped to [0.2, 1.4]**, and only evaluated where expected output exceeds 0.5 kW so it cannot blow up near sunrise or sunset. The bounds are deliberately asymmetric: understating remaining solar only over-charges at the cheap rate, while overstating it enters peak short and imports at the expensive one.
 
-**What this actually detects** is your array's performance against modelled irradiance. Solcast predicts the sun better than any local heuristic could, but it cannot see panel soiling, new shading from a growing tree, inverter derating in heat, or a dropped string. A projection persistently below baseline on clear days is a maintenance signal, not a weather one.
+Once the measured curve is in force this is a genuine weather signal. While the half-sine is still being used it also absorbs that curve's shape error, which is why it reads low all morning and climbs through midday on days with no weather in them at all.
 
-**Conservative bias.** Selection is deliberately asymmetric. Under-charging costs a peak-rate import; over-charging only costs the off-peak/feed-in spread. The projection must therefore travel `forecastUpgradeBias`% of the way toward the next-higher estimate before that estimate is selected (default 60%; 50% would be a neutral nearest-match).
-
-**Stale forecast guard.** Solcast polls on a schedule, so between midnight and the first poll of the day the attributes still hold *yesterday's* values. Charging decisions are suppressed until a fresh forecast arrives, which also covers a failed poll.
+Separately, if generation has effectively stopped while the curve still expects output, remaining solar is treated as **zero** — covering late cloud, an inverter dropout, or terrain shading the sun-angle model knows nothing about.
 
 ---
 
-### Off-Peak Pre-Charging
+## Charging
 
-The app uses a **smart late-start** approach within a configurable daytime window. Rather than charging immediately, it calculates the latest possible start so the Powerwall finishes just before the window closes, maximising solar self-consumption.
+One rule covers every tariff shape:
 
 ```
-kWh needed   = (target% − current%) × total capacity
-hours needed = kWh needed ÷ charge rate
-latest start = window end − hours needed
+in a chargeable period, battery below target  →  Backup-Only
+otherwise                                     →  Self-Powered
 ```
 
-If the Powerwall is already charging, its live power reading is used instead of the configured rate.
+Charging begins at the **start** of a chargeable period whenever the battery is below target, and stops once the target is met.
 
-**Early-start hedge.** The forecast selection is not made until solar noon, which creates a problem: if the day then turns out to be tracking the Low estimate, the target jumps and much of the window is already gone. So before solar noon the app sizes the worst case — the target it would need under the *Low* estimate — and if that charge would not fit in the window remaining after solar noon, it begins at the window start rather than waiting for information it cannot act on.
+The band is **asymmetric**, and it has to be. Charging starts at 2% below target — enough to absorb reporting jitter. But through the afternoon the target ratchets up 2–4 points every quarter hour as the remaining solar shrinks, so stopping the instant the battery reaches it guarantees the next evaluation finds the battery below the new target and starts again. That produced eight mode changes in ninety minutes on one observed day, none of which changed the outcome: the battery was climbing to 99% either way.
 
-This is self-tuning across the year. The post-solar-noon window is around 2h35m midwinter but only about 1h35m midsummer, so early starts correctly become more common in summer. The hedge applies **only before solar noon**; once the selection is made the real target governs.
+So the stop threshold overshoots by however far the target actually climbed over the previous quarter hour — measured, not assumed, so it adapts to the day and the season. On a day when the target is flat or falling the margin is zero and nothing changes. It is capped at 6 points, cannot push past 99%, and zeroes itself when the target has been still for 45 minutes, so the run into peak and the overnight hold are unaffected. Replayed against that day's real trace, seven mode changes become three.
 
-**Closeout protection.** In the final N minutes before window end (default 5), the app forcibly switches back to Self-Powered every minute, bypassing the normal cooldown. This hard deadline ensures the Powerwall is never left in Backup-Only when peak pricing begins, even if device state events arrive late. If severe or extreme weather conditions are active, the closeout delegates to the extreme weather logic instead, so a weather-driven Backup-Only state is not cleared.
+There is no late-start calculation. Starting at the period open trades a modest cost on good solar days — house load bought from grid while charging — for certainty of a full battery at peak. Because the target is self-limiting, this is not "charge for the whole window": on a good solar day the target sits below the battery level and nothing happens at all.
 
-**Top-up suppression.** Once the target has been reached and the Powerwall returns to Self-Powered, any later top-up session within the same window suppresses the early-start hedge and uses only the late-start calculation, so charging waits as long as possible rather than repeatedly importing while solar is available.
+**Closeout.** In the final minutes before Peak begins, the app forces Self-Powered every minute, bypassing the mode-change cooldown. The peak boundary is a hard deadline and reported device state can be stale, so the command repeats until it takes. If severe or extreme weather is active it delegates instead, so a weather-driven Backup-Only is not cleared on the way into peak.
 
----
-
-## How It Works — Free Off-peak Charging
-
-For tariffs with a zero-cost midday window. When grid energy is free there is no optimisation problem left, so this mode ignores the solar forecast entirely and simply fills the battery.
-
-### The Victorian "midday saver" structure
-
-Sorting the periods by price rather than by name is instructive:
-
-| Period | Window | Rate |
-|--------|--------|------|
-| Free | 11am–2pm | **$0.0000** |
-| Solar Soak | 2pm–4pm | **$0.1976** |
-| Off-Peak | 9pm–11am | $0.2478 |
-| Peak | 4pm–9pm | $0.4982 |
-
-Solar Soak is around 20% cheaper than the period actually called "Off-Peak", and it sits immediately before peak — which makes it the cheapest possible place to top up.
-
-### Two stages
-
-**Free window** — hold Backup-Only for the entire window, unconditionally. Backup-Only means the house runs on free grid power while the battery charges and never discharges.
-
-> Dropping to Self-Powered on reaching target — which is correct for paid off-peak — would be exactly backwards here. It would spend free hours draining the battery.
-
-**Solar-soak top-up** — hold Backup-Only only while the battery is under 99%. If the free window left the battery short, topping up here costs $0.1976 to avoid importing at $0.4982. Even after ~90% round-trip losses that is roughly **$0.28/kWh saved**. Charging stops as soon as the battery is full, after which the house runs off the free energy already stored. This stage defaults on and can be disabled if you want strictly zero-cost charging.
-
-At the end of the last active window the Powerwall returns to Self-Powered for peak.
-
-### Deliberate differences from standard mode
-
-- **Vacation Mode is ignored.** Free power is worth taking whether or not anyone is home. The closeout is likewise not suppressed by Vacation Mode, since that would leave the Powerwall in Backup-Only into the peak period.
-- **The charge target is unconditionally 99%.** Every branch of the ladder would land there anyway — severe weather and hot-day both request 100 (capped), and the vacation branches are bypassed by design.
-- **The charge evaluation window is bypassed.** It exists only to schedule the solar surplus calculation, and there is no calculation left.
-- **Solar forecasting and trend analysis keep running** for display only. The trend signal remains a useful site-performance diagnostic regardless of how energy is bought.
-- **Grid outage wins.** If the grid is absent the mode stands down, so it cannot fight the grid-outage handler — and there is no free energy to import during an outage.
+**Weather override.** Severe weather or extreme heat overrides the tariff entirely: the target goes to maximum and charging runs in whatever period is active, **including Peak**. Economics stop applying when the priority is having a charged battery.
 
 ---
 
@@ -286,7 +335,7 @@ Quick reference for the device picker on the main page. Driver requirements and 
 | OpenWeather Alerts Device | OpenWeather Alerts | `sensor` | Yes | — |
 | Power Grid Virtual Presence Sensor | Virtual presence device | `presenceSensor` | Yes | — |
 | Weather Station | Weather Underground | `temperatureMeasurement` | No | No daily max tracking; extreme-heat fallback uses OpenWeather instead |
-| Solar Forecast Device | Solcast_dual | `energyMeter` | No | Solar surplus model cannot run; charge target falls back to 0% |
+| Solar Forecast Device | Solcast_dual | `energyMeter` | No | Target cannot be computed; falls back to 99% |
 | Solar Generation Device | Fronius inverter | `energyMeter` | No | Trend analysis cannot run; Mid estimate always used |
 
 > Both Solcast and Fronius present `capability.energyMeter` and both expose an `energy` attribute, so take care not to transpose the last two.
@@ -342,16 +391,18 @@ Open the app and check the **Status Panel**. Early signs something is misconfigu
 
 ### Solcast polling schedule
 
-The forecast device polls on its own schedule, constrained by the free API tier. The trend analysis depends on getting a baseline before the morning and a fresh reading near solar noon, so poll placement matters more than poll count:
+The Solcast free tier allows a limited number of API calls per day, so the schedule is worth thinking about. Every poll is used: the first sets the trend reference, and each one after it updates the charge target.
+
+Spend them where the forecast still has time to change the outcome — through the morning and across the charging window, ending before peak begins.
 
 | Time | Purpose |
 |------|---------|
-| 08:58 | Baseline snapshot — the day's opening prediction |
-| 09:45 | Fresh data before the early-start decision |
-| 12:15 | Covers winter and shoulder solar noon |
-| 13:15 | Covers summer solar noon |
+| **08:58** | Opening band. Sets the trend reference for the day and the first real target |
+| **09:58** | Early revision, in time for the start of a 09:00–11:00 charging window |
+| **11:58** | Mid-window revision, with the morning's actual weather now in Solcast's model |
+| **13:58** | Last useful revision before peak — the afternoon is what the target is buying against |
 
-Whichever of the last two precedes solar noon is the one in play, so every season gets a forecast no more than about 10 minutes old at the decision point.
+A poll after peak begins cannot change anything: the charging day has closed and the target is held until tomorrow's first poll.
 
 ---
 
@@ -359,51 +410,39 @@ Whichever of the last two precedes solar noon is the one in play, so every seaso
 
 ### Main Page
 
-**Charging Mode** — the three-way selector described above.
-
 **Devices** — assign the six devices.
 
 **Hub Variables** — live status display.
 
 **Overrides**
 - *Disable All Features* — master kill switch. The app registers no subscriptions, no schedules and takes no action, leaving the Powerwall in its current state. Use this to hand full control back to the Tesla app.
-- *Vacation Mode* — disables off-peak charging and hot-day pre-charging while keeping extreme weather protection active. Ignored in Free Off-peak mode.
+- *Vacation Mode* — suppresses charging in periods that cost money, while still permitting it in a free (0¢) period. Extreme weather protection stays active.
 
 **Logging** — debug logging toggle.
 
-### Charge Level *(Off-peak mode only)*
+### Tariff Periods
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Evaluation window | 05:59–14:05 | When `PW_Charge_Target` is recalculated |
+| Number of periods | 3 | 1–8 |
+| Type | — | Super Off-Peak / Off-Peak / Shoulder / Peak |
+| Start / End | — | May wrap midnight |
+| Rate | — | ¢/kWh; `0` makes it a free period |
+| Days | *(blank = all)* | For weekend rates |
+| Charge here | Off | Not offered on Peak periods |
+| Closeout minutes | 5 | Forced Self-Powered before Peak begins |
+| Only in these hub modes | *(blank = all)* | Optional |
+
+### Charge Level
+
+| Setting | Default | Notes |
+|---------|---------|-------|
 | Severe weather charge target | 100% | Capped at 99 |
 | Hot day threshold | 26.0°C | Forecast high forcing a full target |
 | Hot day window | 11:58–15:00 | |
 | Number of Powerwalls | 1 | Each 13.5 kWh |
-| Annual average consumption | — | kWh/day; seasonal curve applied automatically |
+| Annual average consumption | — | **Fallback only** — used when no live load meter is available |
 | Forecast upgrade bias | 60% | How far the projection must travel to select a higher estimate |
-
-### Off-Peak Charging *(Off-peak mode only)*
-
-| Setting | Default | Notes |
-|---------|---------|-------|
-| Earliest charging start | 09:00 | Also the early-start hedge time |
-| Window end | 15:00 | Target finish, before peak |
-| Closeout minutes | 5 | Forced Self-Powered handoff |
-| Assumed charge rate | 3.0 kW | Real-world average; live reading used when charging |
-| Mode restriction | *(blank)* | Optional hub-mode filter |
-
-### Free Off-Peak Charging *(Free mode only)*
-
-| Setting | Default | Notes |
-|---------|---------|-------|
-| Free window start | 11:00 | |
-| Free window end | 14:00 | |
-| Top up during solar soak | On | |
-| Top-up end | 16:00 | Peak period start |
-| Closeout minutes | 5 | |
-| Only on these days | *(blank = all)* | Victoria currently runs 7 days |
-| Only in these hub modes | *(blank = all)* | |
 
 ### Severe Weather Warnings
 
@@ -417,11 +456,11 @@ Whichever of the last two precedes solar noon is the one in play, so every seaso
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Window start | 15:04 | Set after the later of your two modes' window ends |
+| Window start | 15:04 | Set to just after your Peak period begins |
 | Window end | 08:58 | Next morning |
 | Forecast high threshold | 35.0°C | |
 
-> **If you use Free Off-peak mode**, set the window start to **16:04**. At 15:04 it sits inside the solar-soak top-up window. 16:04 is correct for both modes — under standard mode it simply leaves 15:00–16:04 unmanaged, where the Powerwall stays Self-Powered from closeout anyway.
+> Set this a few minutes **after** your Peak period start. If Peak begins at 4pm, use 16:04. Left at 15:04 with a 4pm peak it would sit inside a charging period, and the extreme-weather check would fight the charging logic for control of the Powerwall's mode.
 
 ---
 
@@ -431,14 +470,16 @@ The main page shows a live snapshot, refreshed each time you open the app.
 
 | Field | Description |
 |-------|-------------|
-| Charging Mode | Active mode, and in Free mode which stage is running |
+| Charging Mode | Current tariff period, whether it is charging, and the next peak |
 | Powerwall Mode | Self-Powered / Backup-Only |
 | Battery Level | Current state of charge |
-| Charge Target | Current value of `PW_Charge_Target` |
+| Charge Target | Current value of `PW_Charge_Target`, flagged when held outside the charging day |
 | Solar Generation (today) | Actual generation so far |
-| Solar Forecast Low / Mid / High | All three Solcast estimates, with the active one marked |
-| Trend Analysis | Live projection against the morning baseline, and the resulting selection |
-| Target Calculation | Full working of the surplus model, or the free-mode explanation |
+| Forecast Low / Mid / High (today) | Latest poll, active one marked, with the movement since this morning where it differs |
+| Trend Analysis | Projection so far against **this morning's** band, and the resulting selection |
+| Solar Curve | Whether the measured curve or the idealised half-sine is in use, and how many days are banked |
+| House Load | Current draw, today's daylight average, and the hour-by-hour profile |
+| Target Calculation | Solar remaining minus load until peak, and the resulting hold level |
 | Current Temperature | Live weather station reading |
 | Today's Max Temperature | Highest recorded today (reset at midnight) |
 | Severe Weather Warning | Active / None |
@@ -446,41 +487,61 @@ The main page shows a live snapshot, refreshed each time you open the app.
 
 ---
 
-## Seasonal Consumption Model
+## Seasonal Consumption Model *(fallback only)*
+
+House load is normally measured from the Powerwall's `loadPower`. When no load meter is available the app falls back to a seasonal estimate from the annual average you configure:
 
 ```
 effective consumption = annual average × (1 + 0.25 × cos(2π × month / 12))
 ```
 
-Month 0 = January (summer peak). The ±25% amplitude makes the summer peak about 67% higher than the winter trough, matching a typical Melbourne profile with summer air-conditioning load. If your seasonal swing differs significantly the targets will still be directionally correct — the model's main value is avoiding over-pre-charging on sunny summer days and under-pre-charging on cloudy winter days.
+Month 0 = January (summer peak). The ±25% amplitude makes the summer peak about 67% higher than the winter trough, matching a typical Melbourne profile with summer air-conditioning load. The status panel's Target Calculation row shows whether load is `measured` or `estimated`, so you can tell which path is in use.
 
 ---
 
 ## Known Limitations
 
-**The `0.90` "solar before peak" constant is hardcoded and season-blind.** It assumes 90% of the day's generation lands before peak starts. The true figure varies considerably:
+**Charging starts at the beginning of a chargeable period rather than as late as possible.** This is deliberate — it trades a modest cost on good solar days (house load bought from grid while charging) for certainty of a full battery at peak. The exposure is bounded, because the target is self-limiting: on a good solar day the target sits below the battery level and nothing charges at all.
 
-| Peak start | Midsummer | Midwinter |
-|------------|-----------|-----------|
-| 3pm | ~66% | ~88% |
-| 4pm | ~76% | ~96% |
+**The measured curve needs five days before it does anything.** On a fresh install the half-sine is in force, and on a site whose real curve is asymmetric that biases the charge target high — safe, but it buys grid energy it did not need to. The Solar Curve panel row says when the measured curve takes over.
 
-So the constant is tuned for winter and optimistic in summer, meaning the app under-charges on long summer days. The same applies to the hardcoded 8-hour solar day used for daytime house load. Both are derivable from the sunrise/sunset curve already used by the trend analysis, and `computeSolarModelTarget()` exists as the seam for that change. This only affects **Off-peak Charging** mode; Free mode does not use the solar model.
+**The geometry assumes an unobstructed horizon.** It knows where the sun is, not what is in front of it. Terrain, trees and neighbouring roofs reach the curve only through the measured correction, which needs five days and then follows seasonal change a week or two behind.
+
+**Day restrictions on midnight-wrapping periods** are tested against the day the period *started*. A Friday-only 9pm–11am period is therefore active into Saturday morning, which is almost certainly what you want but is worth knowing.
 
 ---
 
 ## Logging
 
-Enable **Debug Logging** on the main page for per-check detail including forecast selection working, the early-start hedge calculation, and stage transitions. With debug off, the app still logs all mode changes, charge target changes and key trigger events at `info` level.
+Enable **Debug Logging** on the main page for per-check detail including forecast selection working, the solar-remaining correction, and load averaging. With debug off, the app still logs all mode changes, charge target changes and key trigger events at `info` level.
+
+The app is deliberately quiet in normal operation. Steady-state lines ("charging in progress", "target met", "no period covers now") are throttled to once every few minutes rather than logged on every battery report, and the charge target logs at `info` only when it actually moves. Anything representing a *change* still logs immediately.
+
+At the moment the charging day ends — which is when peak begins — a **day summary** is written at `info`:
+
+```
+── Day summary ─────────────────────────────────────────
+  Entered peak at 99% (13.4 kWh stored)
+  Charged from 21% at 11:05, target met 13:49
+  Solar 10.92 kWh vs this morning's 12.47 (88%) · estimate used: mid
+  Solcast revised down 1.3 kWh during the day (final mid 11.2)
+  House load 1.24 kW average across daylight hours
+  Load profile: 0:00 1.4  1:00 0.8  …  15:00 1.2 kW
+  Stored energy worth up to $6.27 at the 46.75c peak rate
+```
+
+That one block is enough to judge a day without reading the rest of the log.
 
 Useful log markers:
 
 ```
 ── 15-min check ──          Scheduled evaluation
 ── Startup evaluation ──    Runs on save/install
-Forecast baseline captured  Morning snapshot taken
+Opening forecast for ...     First poll of the day, sets the trend reference
+Forecast revised up/down     A later poll moved today's expected total
 Forecast selection:         Trend analysis working (debug)
-Early-start hedge:          Worst-case sizing (debug)
+Solar remaining:            Curve estimate × measured ratio (debug)
+Charging:                   Period, target and decision (debug)
 Powerwall → Backup-Only     Mode change, with reason
 ```
 
@@ -492,6 +553,13 @@ Full per-version notes are in the header comment of `AdvancedPowerwallManager.gr
 
 | Version | Change |
 |---------|--------|
+| 4.4.1 | Asymmetric charging band — stop threshold overshoots the climbing target, ending afternoon mode cycling |
+| 4.4.0 | Solar day curve computed from panel geometry; measurement demoted to a correction on top |
+| 4.3.0 | Solar day curve learned from measured generation; median hourly load; forecast clamped to generation-so-far |
+| 4.2.0 | Opening and latest forecast kept separately; target follows same-day revisions; `24_Hour_Estimate` treated as a calendar-day total |
+| 4.1.3 | Charge target held outside the charging day; day summary; quieter logs; House Load panel row |
+| 4.1.0 | House load measured as per-hour averages for today, replacing the rolling average |
+| 4.0.0 | Tariff-driven rewrite; time-varying charge target; measured house load and live solar correction |
 | 3.9.0 | Free Off-peak Charging mode with solar-soak top-up; three-way mode selector |
 | 3.8.0 | Hub variables created automatically; deletion blocked while installed |
 | 3.7.0 | Solar-noon trend analysis replaces the cloud/UV and high-forecast heuristics |
@@ -499,6 +567,6 @@ Full per-version notes are in the header comment of `AdvancedPowerwallManager.gr
 | 3.5.0 | Code review fixes — midnight reset scheduling, priority ladder consolidation |
 | 3.4.0 | Smart top-up charging |
 | 3.3.0 | 99% Backup-Only charge ceiling |
-| 3.0.0 | Guaranteed start time *(superseded by the early-start hedge in 3.7.0)* |
+| 3.0.0 | Guaranteed start time *(superseded, then removed entirely in 4.0.0)* |
 | 2.5.0 | Solar surplus model replaces peak-period model |
 | 1.0.0 | Initial release — direct port of 5 Rule Machine rules |
