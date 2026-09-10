@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target continuously from your tariff periods, the solar still to come, and measured house load.
 
-**Current version: 4.4.1** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
+**Current version: 4.5.0** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
 
 ---
 
@@ -162,7 +162,25 @@ That convergence is what guarantees a full battery at peak. It also avoids charg
 
 A single rolling average cannot represent a load that swings between roughly 0.8 kW and 4.3 kW as a heat pump cycles: a fast average chases each compressor start, a slow one lags an hour behind reality. An hourly bucket is a genuine time-weighted mean including both the on and off portions of the duty cycle, and averaging several of them is stable without being stale.
 
-The hours are combined with a **median, not a mean**, and this matters more than it sounds. Pooling every sample makes the result sample-weighted, so a busy hour dominates: one morning heat-pump run left hour 9 averaging 3.94 kW against 1.08–2.15 kW for every other daylight hour, dragging the figure to 2.21 kW — and because it is projected flat across every remaining hour, that predicted 17.3 kWh of load against 10.5 kWh actual. The median of the hourly means gave 1.70 kW. Below three hours of data it falls back to the pooled mean.
+The hours are combined with a **median, not a mean**. Pooling every sample makes the result sample-weighted, so a busy hour dominates: one morning heat-pump run left hour 9 averaging 3.94 kW against 1.08–2.15 kW for every other daylight hour, dragging the figure to 2.21 kW. The median of the hourly means gave 1.70 kW. Below three hours of data it falls back to the pooled mean.
+
+### Projected hour by hour, not carried flat
+
+Even a good median of *today so far* is the wrong statistic to project forward, because the morning and the afternoon are structurally different. With the heat pump running 07:00–09:00 at 3.3–4.0 kW, the median at 11:02 — the moment the charging decision is made — was 2.15 kW, and carrying that flat to 16:00 predicted 10.9 kWh. The afternoon actually drew about 1.2 kW, or 6.0 kWh. That overstated the target by nearly thirty points and bought about 3 kWh of grid energy the sun would have supplied for nothing.
+
+So each day's hourly means are banked, up to 20 days, and the window to the deadline is walked **hour by hour** using the median of what that hour of the day typically draws:
+
+| Hour | Observed | Median |
+|---|---|---|
+| 11:00 | 2.10 / 1.30 / 0.90 | 1.30 kW |
+| 12:00 | 2.15 / 1.60 / 1.30 | 1.60 kW |
+| 13:00 | 1.70 / 2.10 / 1.00 | 1.70 kW |
+| 14:00 | 1.08 / 1.70 / 1.40 | 1.40 kW |
+| 15:00 | 1.21 / 1.10 / 1.40 | 1.21 kW |
+
+That turns the 11:02 projection into 7.2 kWh against a true 6.0, and the target into 55% instead of 83%.
+
+Hours with no history fall back to today's median, so nothing changes until three days are banked. The House Load panel row says which is in force.
 
 Today's own hours are used rather than a profile learned across days, because consumption tracks weather and occupancy rather than a repeating weekly shape. The buckets reset at midnight, so a misleading value cannot outlive the day that produced it. Overnight hours are excluded — they are not representative of the afternoon being extrapolated into. Until about half an hour of daylight samples exist it falls back to the seasonal model, and a wide gross-error guard catches a unit mix-up or a stuck meter.
 
@@ -553,6 +571,7 @@ Full per-version notes are in the header comment of `AdvancedPowerwallManager.gr
 
 | Version | Change |
 |---------|--------|
+| 4.5.0 | House load projected hour by hour from banked history; opening forecast band waits for all three attributes |
 | 4.4.1 | Asymmetric charging band — stop threshold overshoots the climbing target, ending afternoon mode cycling |
 | 4.4.0 | Solar day curve computed from panel geometry; measurement demoted to a correction on top |
 | 4.3.0 | Solar day curve learned from measured generation; median hourly load; forecast clamped to generation-so-far |

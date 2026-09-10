@@ -24,6 +24,39 @@
  *    Grid presence     Virtual presence sensor, driven externally
  *
  *  Version history:
+ *    4.5.0  HOUSE LOAD IS NOW PROJECTED HOUR BY HOUR, and the opening forecast band no longer
+ *           picks up yesterday's Low and High. Both found reviewing 10 Sep.
+ *
+ *           THE LOAD. One number could never describe a house whose morning and afternoon are
+ *           structurally different, and it failed in the direction that costs money. The heat
+ *           pump ran 07:00-09:00 at 3.3-4.0 kW, so at 11:02 — the moment the charging decision
+ *           is made — the median of the elapsed daylight hours was 2.15 kW and the projection to
+ *           16:00 was 10.9 kWh. The afternoon actually drew about 1.2 kW, or 6.0 kWh.
+ *           Overstating load overstates the target: it held 83% when about 55% was right, and
+ *           roughly 3 kWh of grid energy was bought that the sun would have supplied for free.
+ *
+ *           Each day's hourly means are now banked, up to 20 days, and the window between now
+ *           and the deadline is walked hour by hour using the MEDIAN of what that hour of the
+ *           day typically draws. Replayed against the three days observed so far, the 11:02
+ *           projection becomes 7.2 kWh against a true 6.0 — the target lands at 55% instead of
+ *           83%. Hours with no history fall back to today's median, so behaviour is unchanged
+ *           until three days are banked, and the seasonal model still backstops everything when
+ *           there is no load meter at all.
+ *
+ *           THE BAND. The driver writes Low, Mid and High as three separate events about a
+ *           tenth of a second apart, and 4.4.0 read all three the moment the Mid event landed —
+ *           so the opening band took yesterday's Low and High. On 10 Sep it recorded
+ *           [5.46 / 18.43 / 24.01] when the day's real band was [10.56 / 18.43 / 24.38]. A Low
+ *           understated by 5 kWh moves the downgrade threshold by nearly 2 kWh, in the direction
+ *           that overstates solar and undercharges.
+ *
+ *           The opening capture now waits until every attribute carries today's timestamp, so
+ *           only the last event of a poll can open the day. That also retires the single-
+ *           attribute guard added in 4.3.0: with the band consistent, two handlers racing past
+ *           the gate necessarily read identical values, so a duplicate capture is harmless.
+ *
+ *           The House Load panel row says whether the projection is per-hour or flat, and how
+ *           many days are banked.
  *    4.4.1  The charging band is now asymmetric, which stops the Powerwall cycling through the
  *           afternoon. Found reviewing 9 Sep: eight commanded mode changes between 13:28 and
  *           15:04, none of which changed the outcome.
@@ -782,7 +815,10 @@ def mainPage() {
             } else if (loadAvgKw == null && loadKwNow == null) {
                 loadStr = "Awaiting first reading"
             } else {
+                def loadDays = (state.loadHistory?.get("13") ?: []).size()
                 loadStr = (loadKwNow != null ? "<b>${loadKwNow.round(2)} kW</b> now · " : "") +
+                          (loadDays >= 3 ? "projected by hour from ${loadDays} days · "
+                                         : "projected flat (${loadDays}/3 days banked) · ") +
                           (loadAvgKw != null ? "${loadAvgKw.round(2)} kW daylight average (measured)"
                                              : "using seasonal estimate") +
                           "<div style='color:#555; font-size:0.95em; margin-top:2px;'>" +
@@ -825,7 +861,8 @@ def mainPage() {
                     double totalCap = (numPowerwalls as Integer) * 13.5d
                     double toBatt   = Math.min(totalCap, Math.max(0.0d, solarRem - loadRem))
                     double tgtKwh   = Math.max(0.0d, totalCap - toBatt)
-                    def    loadSrc  = (getMeasuredDaytimeLoadKw() != null) ? "measured" : "estimated"
+                    def    loadSrc  = isLoadProjectedFromHistory() ? "typical by hour"
+                                    : (getMeasuredDaytimeLoadKw() != null) ? "measured" : "estimated"
                     chargeCalcStr = "By ${peakStart.format('HH:mm')}: ${solarRem.round(1)} kWh solar " +
                                     "(${selection.capitalize()}) − ${loadRem.round(1)} kWh load (${loadSrc}) " +
                                     "= ${toBatt.round(1)} kWh to battery → hold ${tgtKwh.round(1)} / ${totalCap} kWh"
@@ -1652,7 +1689,8 @@ def calculateChargeTarget() {
     int    target         = Math.min(99, Math.round((targetKwh / capacity) * 100.0d) as Integer)
 
     double hoursLeft = Math.max(0.01d, (deadline.time - now().toLong()) / 3600000.0d)
-    def    loadSrc   = (getMeasuredDaytimeLoadKw() != null) ? "measured" : "estimated"
+    def    loadSrc   = isLoadProjectedFromHistory() ? "by hour"
+                     : (getMeasuredDaytimeLoadKw() != null) ? "measured" : "estimated"
 
     // One line instead of three. The caller logs it at info only when the target actually
     // moves; an unchanged target is debug, so a quiet afternoon stays quiet.
@@ -1891,6 +1929,60 @@ def solarPowerHandler(evt) {
  * House energy expected between now and the charging deadline, from measured load.
  * Falls back to the seasonal consumption model when no load meter is available.
  */
+/**
+ * Banks today's per-hour load means into the rolling history. Called at midnight, before the
+ * hourly buckets are cleared.
+ */
+private void rollLoadIntoHistory() {
+    def sums   = state.loadHourSum
+    def counts = state.loadHourCount
+    if (!sums || !counts) return
+
+    def hist = state.loadHistory ?: [:]
+    (0..23).each { hr ->
+        def k = "${hr}".toString()
+        int c = (counts[k] ?: 0) as Integer
+        if (c >= 5) {                        // enough samples for the hour's mean to mean something
+            def samples = (hist[k] ?: []) as List
+            samples << ((sums[k] as Double) / c)
+            if (samples.size() > 20) samples = samples[-20..-1]
+            hist[k] = samples
+        }
+    }
+    state.loadHistory = hist
+    int banked = (hist["13"] ?: []).size()
+    logDebug "Load history: banked today's hourly profile — ${banked} day${banked == 1 ? '' : 's'} of history"
+}
+
+/**
+ * What this house typically draws during a given hour of the day, from banked history, or null
+ * until at least three days have been seen for that hour. Median, so one unusual day cannot
+ * move it.
+ */
+private Double getTypicalLoadKw(int hour) {
+    def samples = state.loadHistory?.get("${hour}".toString())
+    if (!samples || samples.size() < 3) return null
+    def sorted = samples.collect { it as Double }.sort()
+    int n      = sorted.size()
+    return (n % 2 == 1) ? (sorted[(int) (n / 2)] as Double)
+                        : (((sorted[(int) (n / 2) - 1] as Double) +
+                            (sorted[(int) (n / 2)] as Double)) / 2.0d)
+}
+
+/**
+ * House load expected between now and the charging deadline, in kWh.
+ *
+ * Projected HOUR BY HOUR from what each hour of the day typically draws, rather than by
+ * carrying one number across the whole window. A single scalar cannot describe a house whose
+ * morning and afternoon are structurally different, and it fails in the direction that costs
+ * money: on 10 Sep the heat pump ran 07:00-09:00 at 3.3-4.0 kW, so at 11:02 the median of the
+ * elapsed daylight hours was 2.15 kW and the projection to 16:00 was 10.9 kWh. The afternoon
+ * actually drew about 1.2 kW, or 6.0 kWh. Overstating load overstates the target, and roughly
+ * 3 kWh of grid energy was bought that the sun would have supplied for nothing.
+ *
+ * Hours with no history fall back to today's median, and the whole thing falls back to the
+ * seasonal model when there is no load meter at all.
+ */
 private Double getLoadUntilDeadlineKwh(Date from = new Date()) {
     def deadline = getChargeDeadline(from)
     if (deadline == null) return null
@@ -1919,7 +2011,46 @@ private Double getLoadUntilDeadlineKwh(Date from = new Date()) {
             kw = capped
         }
     }
-    return kw * hours
+
+    // Walk the window hour by hour, using each hour's own typical draw where history allows
+    double  total       = 0.0d
+    boolean usedHistory = false
+    long    cursor      = from.time
+    int     guard       = 0
+    while (cursor < deadline.time && guard++ < 48) {
+        def cal = Calendar.getInstance(location.timeZone)
+        cal.setTimeInMillis(cursor)
+        int hr = cal.get(Calendar.HOUR_OF_DAY)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        long   segEnd = Math.min(cal.getTimeInMillis() + 3600000L, deadline.time)
+        double span   = (segEnd - cursor) / 3600000.0d
+
+        def typical = getTypicalLoadKw(hr)
+        if (typical != null) {
+            usedHistory = true
+            total += (typical as Double) * span
+        } else {
+            total += (kw as Double) * span
+        }
+        cursor = segEnd
+    }
+    if (usedHistory) logSteady("loadByHour", "Load estimate: ${total.round(1)} kWh to " +
+        "${deadline.format('HH:mm')}, projected from each hour's typical draw", 900)
+    return total
+}
+
+/**
+ * Whether the load projection is coming from banked history rather than today's average.
+ *
+ * Pure — it only reads. The label it feeds is rendered on the settings page, and a function
+ * called during a page render must not write state.
+ */
+private boolean isLoadProjectedFromHistory(Date from = new Date()) {
+    def cal = Calendar.getInstance(location.timeZone)
+    cal.setTime(from)
+    return getTypicalLoadKw(cal.get(Calendar.HOUR_OF_DAY)) != null
 }
 
 /**
@@ -2259,7 +2390,7 @@ def solarForecastHandler(evt) {
     }
     // Stores the latest band every poll, and the opening band only on the first — so the
     // target tracks same-day revisions while the trend reference stays pre-morning.
-    captureForecastSnapshot(evt.name)
+    captureForecastSnapshot()
     chargeCheckHandler()
 }
 
@@ -2903,6 +3034,29 @@ private boolean isForecastStale() {
 }
 
 /**
+ * True until EVERY member of the Low/Mid/High band carries today's timestamp.
+ *
+ * The driver writes the three attributes as three separate events roughly a tenth of a second
+ * apart, and reading them the moment the first arrives picks up yesterday's values for the
+ * other two. Observed 10 Sep: the opening band was recorded as [5.46 / 18.43 / 24.01] when the
+ * day's real band was [10.56 / 18.43 / 24.38] — the Low and High were the previous day's,
+ * because only the Mid event had landed. A Low understated by 5 kWh moves the downgrade
+ * threshold by nearly 2 kWh, in the direction that overstates solar and undercharges.
+ *
+ * Gating on all three means only the last event of a poll can open the day, so the band is
+ * always internally consistent. It also makes a duplicate capture harmless: two handlers
+ * racing past this gate necessarily read identical values.
+ */
+private boolean isBandStale() {
+    if (!solarForecastDevice) return true
+    def midnight = timeToday("00:00", location.timeZone)
+    return ["24_Hour_Estimate", "24_Hour_Estimate_Low", "24_Hour_Estimate_High"].any { a ->
+        def st = solarForecastDevice.currentState(a)
+        return (st?.date == null) || st.date.before(midnight)
+    }
+}
+
+/**
  * Records the Low/Mid/High band on every fresh forecast, keeping two copies of it:
  *
  *   - the OPENING band, from the first poll of the day (~08:58), frozen thereafter
@@ -2923,7 +3077,7 @@ private boolean isForecastStale() {
  * Keeping both also makes the revision itself visible: latest minus opening says whether the
  * day is now expected to do better or worse than it looked at breakfast.
  */
-private void captureForecastSnapshot(String triggerAttr = null) {
+private void captureForecastSnapshot() {
     if (!solarForecastDevice || isForecastStale()) return
     def today = new Date().format("yyyy-MM-dd", location.timeZone)
 
@@ -2939,11 +3093,10 @@ private void captureForecastSnapshot(String triggerAttr = null) {
     state.forecastLatestHigh = high
     state.forecastLatestTime = new Date().format("HH:mm", location.timeZone)
 
-    // Only the mid attribute may open the day. All three fire within milliseconds of each
-    // other and Hubitat runs them as separate handler instances, so the date guard below lost
-    // the race on 8 Sep and two of them wrote an opening band — with different High values.
-    // Restricting it to one attribute means exactly one event per poll can reach that branch.
-    if (triggerAttr != null && triggerAttr != "24_Hour_Estimate") {
+    // The opening band is the trend reference for the whole day, so it must be internally
+    // consistent — every attribute from the same poll. See isBandStale().
+    if (state.forecastSnapshotDate != today && isBandStale()) {
+        logDebug "Opening forecast: waiting for the rest of today's band before taking the trend reference"
         return
     }
 
@@ -3203,6 +3356,9 @@ def resetDailyMaxTemp() {
     // Clear the forecast baseline and selection — the day starts on the middle estimate and
     // the new baseline is captured from the first forecast poll (~08:58). Until then
     // isForecastStale() suppresses charging decisions.
+    // Bank today's hourly profile before the buckets that hold it are cleared
+    rollLoadIntoHistory()
+
     // Today's hourly load buckets expire with the day that produced them
     state.loadHourSum   = null
     state.loadHourCount = null
