@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target continuously from your tariff periods, the solar still to come, and measured house load.
 
-**Current version: 4.5.0** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
+**Current version: 4.5.2** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
 
 ---
 
@@ -181,6 +181,12 @@ So each day's hourly means are banked, up to 20 days, and the window to the dead
 That turns the 11:02 projection into 7.2 kWh against a true 6.0, and the target into 55% instead of 83%.
 
 Hours with no history fall back to today's median, so nothing changes until three days are banked. The House Load panel row says which is in force.
+
+### Sampled on a timer, not on events
+
+`loadPower` reports on change, so sampling it from the attribute event is **change-weighted**: a volatile hour contributes dozens of samples and a steady one contributes a handful. That is the wrong statistic for a mean, and it broke the estimate outright on one observed day — the quiet afternoon hours logged a single sample each, fell below the minimum-count threshold, and were dropped from the median entirely. The figure that survived was 1.71 kW, set by the busy morning, against an afternoon that actually drew 0.70 kW.
+
+Load is therefore sampled **once a minute on a timer**, which makes each hourly bucket a genuine time-weighted average: a five-minute heat-pump burst contributes five samples in sixty, which is exactly what it was.
 
 Today's own hours are used rather than a profile learned across days, because consumption tracks weather and occupancy rather than a repeating weekly shape. The buckets reset at midnight, so a misleading value cannot outlive the day that produced it. Overnight hours are excluded — they are not representative of the afternoon being extrapolated into. Until about half an hour of daylight samples exist it falls back to the seasonal model, and a wide gross-error guard catches a unit mix-up or a stuck meter.
 
@@ -548,7 +554,15 @@ At the moment the charging day ends — which is when peak begins — a **day su
   Stored energy worth up to $6.27 at the 46.75c peak rate
 ```
 
-That one block is enough to judge a day without reading the rest of the log.
+The solar figure there is **generation so far**, not the day's total — the summary fires at the start of peak, with the sun still up. It deliberately makes no forecast comparison, because comparing a partial figure against a whole-day forecast is misleading: on one observed day it reported 98% of forecast when the true figure was 107%, which made a correct trend analysis look wrong.
+
+The honest comparison runs at midnight, once the day is actually over:
+
+```
+Solar final: 25.37 kWh vs this morning's [19.37/23.79/25.05] = 107% of mid · closest was high, app used high ✓
+```
+
+That last clause is the one worth watching — it says whether the morning trend analysis picked the estimate the day turned out to justify.
 
 Useful log markers:
 
@@ -571,6 +585,8 @@ Full per-version notes are in the header comment of `AdvancedPowerwallManager.gr
 
 | Version | Change |
 |---------|--------|
+| 4.5.2 | Day summary no longer compares partial generation against a whole-day forecast; final total reported at midnight |
+| 4.5.1 | House load sampled on a timer rather than on device events, so quiet hours are no longer discarded |
 | 4.5.0 | House load projected hour by hour from banked history; opening forecast band waits for all three attributes |
 | 4.4.1 | Asymmetric charging band — stop threshold overshoots the climbing target, ending afternoon mode cycling |
 | 4.4.0 | Solar day curve computed from panel geometry; measurement demoted to a correction on top |

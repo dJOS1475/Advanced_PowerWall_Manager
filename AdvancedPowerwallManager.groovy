@@ -24,6 +24,60 @@
  *    Grid presence     Virtual presence sensor, driven externally
  *
  *  Version history:
+ *    4.5.2  The day summary no longer compares a PARTIAL generation figure against a whole-day
+ *           forecast. It fires when the charging day closes, which is the start of peak — the
+ *           sun is still up. On 11 Sep it reported "Solar 23.4 kWh vs this morning's 23.8
+ *           (98%)" when the day finished at 25.37 kWh: another 2 kWh, 8% of the day, arrived
+ *           between 16:00 and 17:43. The correct figure was 107%.
+ *
+ *           That is not a cosmetic difference. Reviewing those logs, the truncated total made
+ *           the trend analysis look wrong — it had selected High (25.05) and the apparent
+ *           23.4 sat closer to Mid — and made the geometry curve look as though it understated
+ *           elapsed fraction late in the day. Against the real total both were right: High was
+ *           the nearest estimate by 0.32 kWh, and the curve tracked actual generation to within
+ *           two points from midday to sunset. A summary that misreports the headline number is
+ *           worse than one that omits it.
+ *
+ *           The summary line now reads "Solar X kWh by 16:00 (still generating)" and makes no
+ *           forecast comparison. A new logSolarDayFinal() runs at midnight, before the
+ *           inverter's counter rolls over, and reports the finished total against the morning
+ *           band together with which estimate turned out nearest and which the app actually
+ *           used — the check that says whether the trend analysis called the day correctly.
+ *    4.5.1  House load is now SAMPLED ON A TIMER rather than on device events. Found reviewing
+ *           11 Sep, where the day summary reported a median that its own hourly profile could
+ *           not produce: 1.62 kW against daylight hours of 2.2, 1.5, 1.9, 1.7, 0.8, 0.7, 0.6,
+ *           0.7, 0.7, 0.8, 1.2 — whose median is 0.80.
+ *
+ *           Working out which subset gives the reported figures identifies the fault exactly:
+ *           hours 6-9 plus 10 median 1.70 (logged 1.71 at 15:45), and with 16 added 1.60
+ *           (logged 1.62 at 16:00). The quiet afternoon hours had been discarded.
+ *
+ *           loadPower reports on change, so an event-driven sample is CHANGE-WEIGHTED: a
+ *           volatile hour contributes dozens and a steady one contributes a handful. Hours 12,
+ *           13 and 14 logged a single sample each, fell below the minimum-count gate of 5 in
+ *           getMeasuredDaytimeLoadKw(), and were dropped from the median altogether — leaving
+ *           it set entirely by the busy morning. The bias is one-directional and it buys grid
+ *           energy: the projection for 11:00-16:00 was 8.6 kWh against an actual 3.5 kWh, and
+ *           the target at 11:00 should have been around 20% with the battery already at 48%.
+ *           It charged roughly 2 kWh anyway, exporting the same solar at 0.04c.
+ *
+ *           New loadSampleHandler() reads loadPower once a minute into the hourly buckets, so
+ *           each bucket is a genuine time-weighted mean — a five-minute heat-pump burst
+ *           contributes five samples in sixty, which is what it was. loadPowerHandler keeps
+ *           only the current-draw display and its throttled log line. The minimum-count gate
+ *           drops from 5 to 2 in both getMeasuredDaytimeLoadKw() and rollLoadIntoHistory();
+ *           with regular sampling any real hour clears it, and it now only excludes an hour
+ *           barely started after a restart.
+ *
+ *           rollLoadIntoHistory() carried the same gate, so the per-hour history introduced in
+ *           4.5.0 was banking holes in exactly the quiet hours the projection most depends on.
+ *           Fixed before that history is old enough to be used.
+ *
+ *           Also: the "Forecast revised" line is reported from the mid attribute only. All
+ *           three handlers reach that branch within milliseconds and logSteady's throttle
+ *           cannot help — its state write has not landed before the next instance reads it — so
+ *           11 Sep logged the same revision twice at 12:55 and again at 14:55. The opening-band
+ *           capture keeps its all-attributes-fresh gate from 4.5.0 untouched.
  *    4.5.0  HOUSE LOAD IS NOW PROJECTED HOUR BY HOUR, and the opening forecast band no longer
  *           picks up yesterday's Low and High. Both found reviewing 10 Sep.
  *
@@ -1480,6 +1534,9 @@ def initialize() {
     // Primary logic is event-driven above; these catch any missed events
     runEvery15Minutes("chargeCheckHandler")
     runEvery1Minute("closeoutHandler")
+    // Regular sampling, so every hour's load bucket is a time-weighted mean rather than a
+    // change-weighted one. See loadSampleHandler().
+    runEvery1Minute("loadSampleHandler")
 
     // Fire one minute after the extreme-weather window opens, derived from the setting rather
     // than hardcoded to 15:05 — otherwise moving extremeWindowStart later (e.g. 16:04 on a
@@ -1579,9 +1636,13 @@ private void logDaySummary() {
         lines << "  No grid charging needed today"
     }
     if (actual != null) {
-        def vs = (baseline != null && baseline > 0)
-            ? " vs this morning's ${baseline.round(1)} (${Math.round((actual / baseline) * 100)}%)" : ""
-        lines << "  Solar ${actual} kWh${vs} · estimate used: ${state.selectedEstimate ?: 'mid'}"
+        // Deliberately NOT compared against the forecast here. This runs when the charging day
+        // closes, which is the start of peak — the sun is still up and on 11 Sep another 2 kWh
+        // arrived after it, 8% of the day. Reporting a partial figure against a whole-day
+        // forecast made a 107% day read as 98%, and that misreading led to a real misdiagnosis
+        // of the solar curve. The honest comparison is logSolarDayFinal(), at midnight.
+        lines << "  Solar ${actual} kWh by ${new Date().format('HH:mm', location.timeZone)} " +
+                 "(still generating) · estimate used: ${state.selectedEstimate ?: 'mid'}"
         if (revision != null && Math.abs(revision) >= 0.1d) {
             def latestMid = state.forecastLatestMid as Double
             lines << "  Solcast revised ${revision >= 0 ? 'up' : 'down'} " +
@@ -1831,8 +1892,43 @@ private Date getChargeDeadline(Date from = new Date()) {
  * midnight, which also means a misleading value can never persist beyond the day that produced
  * it — the failure mode a long-running exponential average had.
  */
+/**
+ * Keeps the current draw for display. The hourly buckets are NOT filled from here — see
+ * loadSampleHandler() for why.
+ */
 def loadPowerHandler(evt) {
     double kw = (evt.doubleValue ?: 0.0d) / 1000.0d
+    state.lastLoadKw = kw
+
+    def sums   = state.loadHourSum   ?: [:]
+    def counts = state.loadHourCount ?: [:]
+    String h   = new Date().format("H", location.timeZone)
+    int    c   = (counts[h] ?: 0) as Integer
+    def    avg = (c > 0) ? (((sums[h] as Double) / c)).round(2) : kw.round(2)
+    logSteady("loadPower", "Load power: now ${kw.round(2)} kW; hour ${h} averaging ${avg} kW over ${c} samples", 900)
+}
+
+/**
+ * Samples house load once a minute into the hourly buckets.
+ *
+ * Deliberately a TIMER rather than the attribute event. loadPower reports on change, so an
+ * event-driven sample is change-weighted: a volatile hour contributes dozens of samples and a
+ * steady one contributes a handful. That is the wrong statistic for a mean, and on 11 Sep it
+ * broke the load estimate outright — the quiet afternoon hours logged one sample each, fell
+ * below the minimum-count gate in getMeasuredDaytimeLoadKw(), and were dropped from the median
+ * entirely. The figure that survived was 1.71 kW, set by the busy morning, against an afternoon
+ * that actually drew 0.70 kW. The charge target inherited the error and bought grid energy the
+ * sun was about to supply.
+ *
+ * Sampling on a fixed interval makes each bucket a genuine time-weighted average: a five-minute
+ * heat-pump burst contributes five samples in sixty, which is exactly what it was.
+ */
+def loadSampleHandler() {
+    if (!powerwallDevice) return
+    def raw = powerwallDevice.currentValue("loadPower")
+    if (raw == null) return
+
+    double kw = (raw as Double) / 1000.0d
     String h  = new Date().format("H", location.timeZone)
 
     def sums   = (state.loadHourSum   ?: [:])
@@ -1842,10 +1938,7 @@ def loadPowerHandler(evt) {
 
     state.loadHourSum   = sums
     state.loadHourCount = counts
-    state.lastLoadKw    = kw
-
-    logSteady("loadPower", "Load power: now ${kw.round(2)} kW; hour ${h} averaging " +
-              "${(((sums[h] as Double) / (counts[h] as Integer))).round(2)} kW over ${counts[h]} samples", 900)
+    if (state.lastLoadKw == null) state.lastLoadKw = kw
 }
 
 /**
@@ -1876,7 +1969,11 @@ private Double getMeasuredDaytimeLoadKw() {
         if (c > 0) {
             total += (sums[k] as Double)
             n     += c
-            if (c >= 5) means << ((sums[k] as Double) / c)
+            // Low enough that a genuinely quiet hour still counts. The old threshold of 5 was
+            // written for change-driven samples and silently discarded every low-draw hour;
+            // with loadSampleHandler() filling the buckets on a timer, any real hour clears
+            // this easily and the gate only excludes a barely-started one after a restart.
+            if (c >= 2) means << ((sums[k] as Double) / c)
         }
     }
     // Roughly half an hour of samples before any of this means anything
@@ -1930,6 +2027,36 @@ def solarPowerHandler(evt) {
  * Falls back to the seasonal consumption model when no load meter is available.
  */
 /**
+ * Reports the finished day's generation against the band that was forecast for it. Called at
+ * midnight, before the inverter's daily counter rolls over.
+ *
+ * This is the only point at which the comparison is fair: the day summary fires when the
+ * charging day closes at the start of peak, with the sun still up. Naming the nearest estimate
+ * is what tells you whether the morning trend analysis actually called the day correctly.
+ */
+private void logSolarDayFinal() {
+    def actual = solarGenerationDevice?.currentValue("energy")?.toDouble()
+    if (actual == null || actual <= 0.0d) return
+
+    def low  = getOpeningForecast("low")
+    def mid  = getOpeningForecast("mid")
+    def high = getOpeningForecast("high")
+    if (mid == null || mid <= 0.0d) {
+        log.info "Solar final: ${actual.round(2)} kWh"
+        return
+    }
+
+    def band    = [low: low, mid: mid, high: high].findAll { k, v -> v != null }
+    def nearest = band.min { k, v -> Math.abs(actual - (v as Double)) }?.key
+    def used    = state.selectedEstimate ?: "mid"
+
+    log.info "Solar final: ${actual.round(2)} kWh vs this morning's " +
+             "[${low != null ? low : '–'}/${mid}/${high != null ? high : '–'}] = " +
+             "${Math.round((actual / mid) * 100)}% of mid · closest was ${nearest}, " +
+             "app used ${used}${nearest == used ? ' ✓' : ''}"
+}
+
+/**
  * Banks today's per-hour load means into the rolling history. Called at midnight, before the
  * hourly buckets are cleared.
  */
@@ -1942,7 +2069,7 @@ private void rollLoadIntoHistory() {
     (0..23).each { hr ->
         def k = "${hr}".toString()
         int c = (counts[k] ?: 0) as Integer
-        if (c >= 5) {                        // enough samples for the hour's mean to mean something
+        if (c >= 2) {                        // see getMeasuredDaytimeLoadKw() on why this is low
             def samples = (hist[k] ?: []) as List
             samples << ((sums[k] as Double) / c)
             if (samples.size() > 20) samples = samples[-20..-1]
@@ -2390,7 +2517,7 @@ def solarForecastHandler(evt) {
     }
     // Stores the latest band every poll, and the opening band only on the first — so the
     // target tracks same-day revisions while the trend reference stays pre-morning.
-    captureForecastSnapshot()
+    captureForecastSnapshot(evt.name)
     chargeCheckHandler()
 }
 
@@ -3077,7 +3204,7 @@ private boolean isBandStale() {
  * Keeping both also makes the revision itself visible: latest minus opening says whether the
  * day is now expected to do better or worse than it looked at breakfast.
  */
-private void captureForecastSnapshot() {
+private void captureForecastSnapshot(String triggerAttr = null) {
     if (!solarForecastDevice || isForecastStale()) return
     def today = new Date().format("yyyy-MM-dd", location.timeZone)
 
@@ -3101,10 +3228,13 @@ private void captureForecastSnapshot() {
     }
 
     if (state.forecastSnapshotDate == today) {
-        // The mid attribute fires once per poll, so this is a genuine revision, but the
-        // threshold still keeps a 0.00 kWh "revision" out of the log after a no-change poll.
+        // Report the revision once per poll, from the mid attribute only. All three handlers
+        // reach this branch within milliseconds of each other and logSteady's own throttle
+        // cannot help: its state write has not landed before the next instance reads it, so
+        // 11 Sep logged the same revision twice at 12:55 and again at 14:55.
+        boolean mayReport = (triggerAttr == null || triggerAttr == "24_Hour_Estimate")
         def openMid = state.forecastSnapshotMid as Double
-        if (openMid != null) {
+        if (mayReport && openMid != null) {
             double delta = mid - openMid
             if (Math.abs(delta) >= 0.05d) {
                 logSteady("forecastRevision",
@@ -3356,7 +3486,9 @@ def resetDailyMaxTemp() {
     // Clear the forecast baseline and selection — the day starts on the middle estimate and
     // the new baseline is captured from the first forecast poll (~08:58). Until then
     // isForecastStale() suppresses charging decisions.
-    // Bank today's hourly profile before the buckets that hold it are cleared
+    // Report the finished day against its forecast, and bank today's hourly profile, both
+    // before the counters that hold them are cleared
+    logSolarDayFinal()
     rollLoadIntoHistory()
 
     // Today's hourly load buckets expire with the day that produced them
