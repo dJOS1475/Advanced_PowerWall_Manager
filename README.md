@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that consolidates Tesla Powerwall management into a single, event-driven application. Replaces five separate Rule Machine rules with solar-aware logic that adjusts the Powerwall charge target continuously from your tariff periods, the solar still to come, and measured house load.
 
-**Current version: 4.5.2** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
+**Current version: 4.5.3** · Written and tested against a **Tesla Powerwall 2** (DarwinsDen integration), **Solcast_dual**, a **Fronius** inverter, **OpenWeather Alerts** and **Weather Underground**, on an Australian time-of-use tariff.
 
 ---
 
@@ -585,6 +585,7 @@ Full per-version notes are in the header comment of `AdvancedPowerwallManager.gr
 
 | Version | Change |
 |---------|--------|
+| 4.5.3 | Fixes a crash in the midnight reset introduced by 4.5.2 |
 | 4.5.2 | Day summary no longer compares partial generation against a whole-day forecast; final total reported at midnight |
 | 4.5.1 | House load sampled on a timer rather than on device events, so quiet hours are no longer discarded |
 | 4.5.0 | House load projected hour by hour from banked history; opening forecast band waits for all three attributes |

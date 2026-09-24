@@ -24,6 +24,14 @@
  *    Grid presence     Virtual presence sensor, driven externally
  *
  *  Version history:
+ *    4.5.3  Fixes a crash in the midnight reset introduced by 4.5.2. logSolarDayFinal() passed a
+ *           two-parameter closure to Map.min(), which Groovy treats as a comparator between two
+ *           entries rather than (key, value) — so the value arrived as a Map.Entry and the cast
+ *           to Double threw GroovyCastException. Because it ran inside resetDailyMaxTemp(), the
+ *           exception aborted everything after it: load history banking, clearing the hourly
+ *           load buckets, the day's charge tracking, the estimate selection and the forecast
+ *           snapshot. The closure is now single-parameter, and the three reporting/banking calls
+ *           are each wrapped so a failure in any of them logs an error and the reset continues.
  *    4.5.2  The day summary no longer compares a PARTIAL generation figure against a whole-day
  *           forecast. It fires when the charging day closes, which is the start of peak — the
  *           sun is still up. On 11 Sep it reported "Solar 23.4 kWh vs this morning's 23.8
@@ -2047,7 +2055,10 @@ private void logSolarDayFinal() {
     }
 
     def band    = [low: low, mid: mid, high: high].findAll { k, v -> v != null }
-    def nearest = band.min { k, v -> Math.abs(actual - (v as Double)) }?.key
+    // One-parameter closure, deliberately. Map.min() treats a TWO-parameter closure as a
+    // comparator between entries, so `v` arrives as a Map.Entry and the cast throws — which on
+    // 24 Sep aborted the whole midnight reset.
+    def nearest = band.min { e -> Math.abs(actual - (e.value as Double)) }?.key
     def used    = state.selectedEstimate ?: "mid"
 
     log.info "Solar final: ${actual.round(2)} kWh vs this morning's " +
@@ -3477,7 +3488,7 @@ def temperatureHandler(evt) {
 def resetDailyMaxTemp() {
     // Before anything else: yesterday's generation counter has not rolled over yet, so this is
     // the last moment its hourly profile can be banked.
-    rollSolarShapeIntoHistory()
+    try { rollSolarShapeIntoHistory() } catch (e) { log.error "Midnight reset: solar shape banking failed – ${e}" }
 
     def prev = state.dailyMaxTemp
     state.dailyMaxTemp             = weatherStation?.currentValue("temperature")?.toDouble()
@@ -3488,8 +3499,11 @@ def resetDailyMaxTemp() {
     // isForecastStale() suppresses charging decisions.
     // Report the finished day against its forecast, and bank today's hourly profile, both
     // before the counters that hold them are cleared
-    logSolarDayFinal()
-    rollLoadIntoHistory()
+    // Reporting and banking must never be able to abort the reset: everything below clears
+    // state the new day depends on. On 24 Sep an exception in logSolarDayFinal() skipped all
+    // of it, leaving yesterday's load buckets, charge tracking and estimate selection live.
+    try { logSolarDayFinal() }    catch (e) { log.error "Midnight reset: solar day report failed – ${e}" }
+    try { rollLoadIntoHistory() } catch (e) { log.error "Midnight reset: load history banking failed – ${e}" }
 
     // Today's hourly load buckets expire with the day that produced them
     state.loadHourSum   = null
